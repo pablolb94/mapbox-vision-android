@@ -31,6 +31,7 @@ import com.mapbox.vision.video.videosource.VideoSourceListener
 import com.mapbox.vision.video.videosource.camera.Camera2VideoSourceImpl
 import com.mapbox.vision.video.videosource.camera.SurfaceVideoRecorder
 import com.mapbox.vision.video.videosource.camera.VideoRecorder
+import com.mapbox.vision.video.videosource.file.FileVideoSource
 import java.io.File
 
 object VisionManager {
@@ -59,8 +60,6 @@ object VisionManager {
     private var sessionManager: TelemetrySessionManager? = null
     private var videoRecorder: VideoRecorder? = null
     private var externalVideoSourceListener: VideoSourceListener? = null
-
-    private lateinit var rootTelemetryDir: String
 
     @Volatile
     private var isStarted = false
@@ -97,6 +96,10 @@ object VisionManager {
             imageFormat: ImageFormat,
             imageSize: ImageSize
         ) {
+            (videoSource as? VideoSource.WithProgress)?.let {
+                nativeVisionManager.setTelemetryTimestamp(it.getProgress())
+            }
+
             nativeVisionManager.setFrame(
                 rgbaByteArray = rgbaBytes,
                 imageFormat = imageFormat,
@@ -137,6 +140,8 @@ object VisionManager {
         }
     }
 
+    private lateinit var rootTelemetryDir: String
+
     /**
      * Initialize SDK with mapbox access token and application instance.
      * Do it once per application session, eg in [android.app.Application.onCreate].
@@ -147,15 +152,38 @@ object VisionManager {
         this.application = application
     }
 
-    /**
-     * Initialize SDK. Creates core services and allocates necessary resources.
-     * No-op if called while SDK is created already.
-     */
-    @JvmOverloads
-    @JvmStatic
-    fun create(
-        videoSource: VideoSource = Camera2VideoSourceImpl(application)
-    ) {
+    sealed class VisionMode {
+        data class Default(
+            private val application: Application,
+            val videoSource: VideoSource = Camera2VideoSourceImpl(application)
+        ) : VisionMode()
+
+        data class SessionRecord(val path: String) : VisionMode()
+
+        data class SessionReplay(
+            val path: String,
+            val videoSource: VideoSource.WithProgress = FileVideoSource(
+                application,
+                videoFiles = File(path)
+                    .listFiles
+                    { _: File?, name: String? ->
+                        name?.contains("mp4") ?: false
+                    }
+                    .sorted(),
+                onVideoStarted = {},
+                onVideosEnded = {}
+            )
+        ) : VisionMode() {
+
+            fun setSessionProgress(timestamp: Long) {
+                videoSource.setProgress(timestamp)
+            }
+        }
+    }
+
+    private lateinit var mode: VisionMode
+
+    private fun createCommon() {
         checkManagerInit()
         if (isCreated) {
             VisionLogger.w(TAG, "VisionManager was already created!")
@@ -181,7 +209,6 @@ object VisionManager {
         )
 
         sensorsManager = SensorsManager(application)
-        sensorsManager.setSensorDataListener(sensorDataListener)
         locationEngine = AndroidLocationEngineImpl(application)
         videoProcessor = VideoProcessor.Impl()
 
@@ -192,22 +219,78 @@ object VisionManager {
             rootTelemetryDir = rootTelemetryDir
         )
         performanceManager = PerformanceManager.getPerformanceManager(nativeVisionManager)
+    }
+
+    /**
+     * Initialize SDK. Creates core services and allocates necessary resources.
+     * No-op if called while SDK is created already.
+     */
+    @JvmOverloads
+    @JvmStatic
+    fun create(
+        videoSource: VideoSource = Camera2VideoSourceImpl(application)
+    ) {
+        createCommon()
+
+        val videoRecorder = SurfaceVideoRecorder.MediaCodecPersistentSurfaceImpl(application)
+        (videoSource as? Camera2VideoSourceImpl)?.setVideoRecorder(videoRecorder)
 
         this.videoSource = videoSource
-        (videoSource as? Camera2VideoSourceImpl)?.let {
-            val videoRecorder = SurfaceVideoRecorder.MediaCodecPersistentSurfaceImpl(application)
-            it.setVideoRecorder(videoRecorder)
+        this.videoRecorder = videoRecorder
 
-            this.videoRecorder = videoRecorder
+        sessionManager = TelemetrySessionManager.RotatedBuffersImpl(
+            application,
+            nativeVisionManager,
+            rootTelemetryDir,
+            videoRecorder,
+            telemetryImageSaver,
+            sessionListener
+        )
+        this.mode = VisionManager.VisionMode.Default(application, videoSource)
 
-            sessionManager = TelemetrySessionManager.RotatedBuffersImpl(
-                application,
-                nativeVisionManager,
-                rootTelemetryDir,
-                videoRecorder,
-                telemetryImageSaver,
-                sessionListener
-            )
+        isCreated = true
+    }
+
+    @JvmOverloads
+    @JvmStatic
+    fun createWithMode(
+        mode: VisionManager.VisionMode = VisionManager.VisionMode.Default(application)
+    ) {
+        when (mode) {
+            is VisionMode.Default -> {
+                create(mode.videoSource)
+            }
+            is VisionMode.SessionRecord -> {
+                createCommon()
+
+                val videoSource = Camera2VideoSourceImpl(application)
+                val videoRecorder = SurfaceVideoRecorder.MediaCodecPersistentSurfaceImpl(application)
+                videoSource.setVideoRecorder(videoRecorder)
+
+                this@VisionManager.videoSource = videoSource
+                this@VisionManager.videoRecorder = videoRecorder
+
+                sessionManager = TelemetrySessionManager.RecordingImpl(
+                    nativeVisionManager,
+                    sessionDir = "${mode.path}/",
+                    videoRecorder = videoRecorder,
+                    telemetryImageSaver = telemetryImageSaver
+                )
+
+                this.mode = mode
+            }
+            is VisionMode.SessionReplay -> {
+                createCommon()
+
+                this.videoSource = mode.videoSource
+
+                sessionManager = TelemetrySessionManager.ReplayImpl(
+                    nativeVisionManager,
+                    "${mode.path}/"
+                )
+
+                this.mode = mode
+            }
         }
 
         isCreated = true
@@ -235,12 +318,13 @@ object VisionManager {
                 setCountry(country)
             }
         })
-        sensorsManager.start()
-        locationEngine.attach(nativeVisionManager)
-        videoProcessor.attach(videoProcessorListener)
+        if (mode !is VisionManager.VisionMode.SessionReplay) {
+            sensorsManager.start(sensorDataListener)
+            locationEngine.attach(nativeVisionManager)
+            videoProcessor.attach(videoProcessorListener)
+        }
         sessionManager?.start()
         videoSource.attach(videoSourceListener)
-
     }
 
     fun setCountry(country: Country) {
@@ -286,9 +370,13 @@ object VisionManager {
 
         videoSource.detach()
         sessionManager?.stop()
-        videoProcessor.detach()
-        locationEngine.detach()
-        sensorsManager.stop()
+
+        if (mode !is VisionManager.VisionMode.SessionReplay) {
+            locationEngine.detach()
+            sensorsManager.stop()
+            videoProcessor.detach()
+        }
+
         nativeVisionManager.stop()
         isStarted = false
     }

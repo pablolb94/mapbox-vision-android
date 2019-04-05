@@ -101,4 +101,42 @@ internal interface TelemetrySessionManager {
             buffers.rotate()
         }
     }
+
+    class RecordingImpl(
+        private val nativeVisionManager: NativeVisionManager,
+        private val sessionDir: String,
+        private val videoRecorder: VideoRecorder,
+        private val telemetryImageSaver: TelemetryImageSaver
+    ) : TelemetrySessionManager {
+
+        private val rotatedBuffers = RotatedBuffers(
+            buffersDir = sessionDir,
+            totalBuffersNumber = 1
+        )
+
+        override fun start() {
+            File(sessionDir).mkdirs()
+            telemetryImageSaver.setSessionDir(sessionDir)
+            nativeVisionManager.startTelemetrySavingSession(sessionDir)
+            rotatedBuffers.rotate()
+            videoRecorder.startRecording(rotatedBuffers.getBuffer())
+        }
+
+        override fun stop() {
+            nativeVisionManager.stopTelemetrySavingSession()
+            videoRecorder.stopRecording()
+        }
+    }
+
+    class ReplayImpl(
+        private val nativeVisionManager: NativeVisionManager,
+        private val sessionDir: String
+    ) : TelemetrySessionManager {
+
+        override fun start() {
+            nativeVisionManager.playTelemetry(sessionDir)
+        }
+
+        override fun stop() {}
+    }
 }
